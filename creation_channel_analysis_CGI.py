@@ -14,9 +14,6 @@ from pathlib import Path
 
 import matplotlib
 matplotlib.use("MacOSX")
-import plotly.express as px
-import plotly.graph_objects as go
-import plotly.io as pio
 
 import matplotlib.pyplot as plt
 plt.ioff()
@@ -34,7 +31,6 @@ sys.path.append(path)
 file_name=r'CGI_transactions.xlsx'
 save_folder=r'plots_weekday_hour'
 offset_months=6 # based on how many months a "norm" is calculated
-actuals_period={'from':'2025-10-27','until':'2025-11-02'}
 from_period='2025-10-27'
 until_period='2025-11-02'
 
@@ -64,9 +60,6 @@ hour_dict={'00-01':1,
            '23-00':24
            }
 
-day_hours_high_traffic=[8,9,10,11,12,13,14,15,16,17,18,19,20,21,22]
-night_hours_low_traffic=[1,2,3,4,5,6,7,23,24]
-
 # =============================================================================
 # Run parameters
 # =============================================================================
@@ -95,7 +88,6 @@ def full_timeseries_analysis(file_name,offset_months):
     df = prepare_data(file_name)
     last_date = df['Date'].max()
     start_date = last_date - pd.DateOffset(months=offset_months)
-    # keep only data from the last 'offset_months' months for baseline calculation
     df_baseline = df[df['Date'] >= start_date]
     df_baseline = (
         df_baseline.groupby(['Weekday', 'Hour'])['Transactions']
@@ -114,40 +106,24 @@ def full_timeseries_analysis(file_name,offset_months):
     # Main alert threshold (boxplot-style robust lower bound)
 
     # Optional alternative thresholds (more/less strict)
-    df_baseline['lower_threshold'] = df_baseline['p10'].clip()
+    df_baseline['lower_threshold'] = df_baseline['p5'].clip()
     df_output=df.merge(df_baseline, on=['Weekday', 'Hour'], how='left')
 
     df_output = df_output.sort_values('Date')  # important!
-    df_output['Hour']=df_output['Hour'].astype(int)
 
+    df_output['alert_raw'] = (
+            (df_output['Transactions'] < df_output['lower_threshold']) &
+            (df_output['Transactions'] < 0.5 * df_output['median'])
+    )  # checking alert conditions for all hours
+
+    df_output['is_alert'] = (
+            df_output['alert_raw'] &
+            df_output['alert_raw'].shift(1).fillna(False).astype(bool)
+    )  # checking if previous hour was also an alert
+
+    df_issue=df_output[df_output['is_alert']==True]
     print("Full timeseries analysis completed.")
-    return df_output
-
-def day_hours_alerting(df_output,day_hours_high_traffic):
-    df_alert_day=df_output.copy()
-    df_alert_day=df_alert_day.loc[df_alert_day['Hour'].isin(day_hours_high_traffic)]
-    # Flag alerts during high traffic hours
-    condition = ((df_alert_day['Transactions'] < df_alert_day['lower_threshold'])&(df_alert_day['Transactions']<=df_alert_day['median']*0.5))
-    df_alert_day.loc[condition, 'is_alert'] = True
-    df_alert_day=df_alert_day[df_alert_day['is_alert']==True] #keep only hours when alerted will be triggered
-    print("Day hours alerting completed.")
-    return df_alert_day
-
-def night_hours_alerting(df_output,night_hours_low_traffic):
-    df_alert_night=df_output.copy()
-    # Flag alerts during low traffic hours
-    condition = ((df_alert_night['Transactions'] < df_alert_night['lower_threshold']) & (
-                df_alert_night['Transactions'] <= df_alert_night['median'] * 0.5))
-    df_alert_night['is_alert'] = (
-        condition
-        .rolling(window=3, min_periods=3)
-        .sum()
-        .ge(3)
-    ) # only trigger an alert if 3 consecutive hours are below threshold
-    df_alert_night=df_alert_night.loc[df_alert_night['Hour'].isin(night_hours_low_traffic)]
-    df_alert_night=df_alert_night[df_alert_night['is_alert']==True] #keep only hours when alerted will be triggered
-    print("Night hours alerting completed.")
-    return df_alert_night
+    return df_output,df_issue
 
 
 def prepare_baseline_with_stats(df,df_target,offset_months):
@@ -174,8 +150,8 @@ def prepare_baseline_with_stats(df,df_target,offset_months):
     # Main alert threshold (boxplot-style robust lower bound)
 
     # Optional alternative thresholds (more/less strict)
-    df_baseline['lower_threshold'] = df_baseline['p10'].clip(
-        lower=0)  # This hour is worse than 90% of historical observations
+    df_baseline['lower_threshold'] = df_baseline['p5'].clip(
+        lower=0)  # This hour is worse than 95% (or 90%) of historical observations
     print("Baseline with statistics prepared.")
     return df_baseline
 
@@ -183,24 +159,14 @@ def prepare_baseline_with_stats(df,df_target,offset_months):
 # Code
 # =============================================================================
 
-df_output=full_timeseries_analysis(file_name,offset_months)
-df_alert_day=day_hours_alerting(df_output,day_hours_high_traffic)
-df_alert_night=night_hours_alerting(df_output,night_hours_low_traffic)
-# Combine day and night alerts
-df_alerts=pd.concat([df_alert_day,df_alert_night]).sort_values(['Date','Hour'])
-df_alerts.reset_index(drop=True,inplace=True)
-
-df_alerts_count=df_alerts.groupby(['Date','Hour']).size().reset_index(name='Alerted_hours_count')
+df_full,df_issues=full_timeseries_analysis(file_name,offset_months)
 
 for target_day in ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday']:
     # target_day='Monday'
     # select only one day of the week for analysis
     df = prepare_data(file_name)
-    df_target = df.loc[df['Date'].between(actuals_period.get('from'), actuals_period.get('until'))]
+    df_target = df.loc[df['Date'].between(from_period, until_period)]
     df_target=df_target[df_target['Weekday']==target_day]
-
-    title_date=df_target['Date'].unique()[0]
-    title_date=pd.to_datetime(title_date,format='%d-%m-%Y').date()
 
     df_baseline=prepare_baseline_with_stats(df,df_target,offset_months)
 
@@ -255,7 +221,7 @@ for target_day in ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'
         print(f"WARNING: No rows found for {target_date.date()} in the file.")
 
     # --- Cosmetics to match your wireframe intent ---
-    ax.set_title(f"{target_day} on {title_date}: Transactions vs historical baseline (Median, IQR, p10)")
+    ax.set_title("Monday: Transactions vs historical baseline (Median, IQR, p10)")
     ax.set_xlabel("Hour")
     ax.set_ylabel("# of transactions")
     ax.set_xlim(1, 24)
@@ -268,7 +234,7 @@ for target_day in ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'
     # save the plot
 
     plt.savefig(
-        os.path.join(save_folder, f"Alerting_below_norm_{target_day}_{title_date} for period {from_period}-{until_period}.png"),
+        os.path.join(save_folder, f"weekday_hour{target_day}_{from_period}-{until_period}.png"),
         dpi=300
     )
     plt.close()
@@ -277,9 +243,3 @@ for target_day in ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'
 
 
 
-df = prepare_data(file_name)
-df_targer=df.loc[df['Date']=='2025-10-29']
-df_baseline = df.loc[df['Date'] != df_target['Date'].unique()[0]] #we should exclude the very day from baseline (norm) calculation
-df_baseline=create_norm_calculation(df_baseline)
-df_output = df_target.merge(df_baseline, on=['Weekday', 'Hour'], how='left')
-#add plotly code here as a final step... WIP
